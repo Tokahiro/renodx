@@ -2387,6 +2387,53 @@ bool initialized = false;
 extern "C" __declspec(dllexport) constexpr const char* NAME = "RenoDX";
 extern "C" __declspec(dllexport) constexpr const char* DESCRIPTION = "RenoDX for Unreal Engine";
 
+// --- test patch: leave root signatures created by upscaler / frame-gen libraries untouched ---
+static bool IsThirdPartyUpscalerModule(const wchar_t* path) {
+  const wchar_t* name = path;
+  for (const wchar_t* c = path; *c != L'\0'; ++c) {
+    if (*c == L'\\' || *c == L'/') name = c + 1;
+  }
+  static const wchar_t* const PREFIXES[] = {
+      L"libxess",         // libxess.dll, libxess_fg.dll, libxess_dx11.dll
+      L"libxell",         // Intel XeLL
+      L"igxess",          // Intel driver-side XeSS
+      L"amd_fidelityfx",  // FSR upscaler / frame generation
+      L"nvngx",           // DLSS feature DLLs
+  };
+  for (const wchar_t* prefix : PREFIXES) {
+    if (_wcsnicmp(name, prefix, wcslen(prefix)) == 0) return true;
+  }
+  return false;
+}
+
+static bool OnCreatePipelineLayoutFilter(reshade::api::device* /*device*/, std::span<reshade::api::pipeline_layout_param> params) {
+  if (params.size() >= 20) return false;
+
+  void* frames[48];
+  const USHORT frame_count = CaptureStackBackTrace(0, 48, frames, nullptr);
+  HMODULE last_module = nullptr;
+  for (USHORT i = 0; i < frame_count; ++i) {
+    HMODULE module = nullptr;
+    if (GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            static_cast<LPCWSTR>(frames[i]), &module)
+        == 0) {
+      continue;
+    }
+    if (module == nullptr || module == last_module) continue;
+    last_module = module;
+
+    wchar_t path[MAX_PATH];
+    if (GetModuleFileNameW(module, path, MAX_PATH) == 0) continue;
+    if (IsThirdPartyUpscalerModule(path)) {
+      reshade::log::message(reshade::log::level::info, "[xess-exempt] skipped pipeline layout injection for third-party caller");
+      return false;  // keep the caller's root signature exactly as authored
+    }
+  }
+  return true;
+}
+// --- end test patch ---
+
 BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH:
@@ -2397,9 +2444,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::reshade_overlay>(OnOverlay);
       // end keybind code
 
-      renodx::mods::shader::on_create_pipeline_layout = [](auto, auto params) {
-        return (params.size() < 20);
-      };
+      renodx::mods::shader::on_create_pipeline_layout = &OnCreatePipelineLayoutFilter;
 
       if (!initialized) {
         AddGameSettings();
