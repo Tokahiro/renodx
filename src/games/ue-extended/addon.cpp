@@ -7,6 +7,13 @@
 #define DEBUG_LEVEL_0
 
 #include <algorithm>
+#include <array>
+#include <cwchar>
+#include <iterator>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_set>
 
 #include <deps/imgui/imgui.h>
 #include <embed/shaders.h>
@@ -2386,6 +2393,85 @@ void AddAdvancedSettings() {
   }});
 }
 
+// Upscaler and frame generation runtimes build their compute pipelines against
+// their own root signatures. Custom shaders never replace those pipelines, so
+// the injected constants are never read there, but the rewritten root signature
+// no longer matches what the vendor shipped. With Intel XeSS this can make the
+// Intel driver fault during XeSS dispatches, so their layouts are left as is.
+constexpr std::array<std::wstring_view, 4> UPSCALER_MODULE_PREFIXES = {
+    L"libxess",         // Intel XeSS, XeSS-FG
+    L"amd_fidelityfx",  // AMD FidelityFX API (FSR 3.1+)
+    L"ffx_",            // AMD FidelityFX SDK (FSR 2/3)
+    L"nvngx",           // NVIDIA NGX (DLSS, DLSS-RR, DLSS-FG)
+};
+
+std::mutex skipped_upscaler_modules_mutex;
+std::unordered_set<std::wstring> skipped_upscaler_modules;
+
+std::wstring GetModuleName(HMODULE module) {
+  std::array<wchar_t, 1024> path = {};
+  const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+  if (length == 0 || length >= path.size()) return {};
+
+  const std::wstring_view full_path(path.data(), length);
+  const auto separator = full_path.find_last_of(L"\\/");
+  return std::wstring(separator == std::wstring_view::npos ? full_path : full_path.substr(separator + 1));
+}
+
+bool IsUpscalerModuleName(std::wstring_view name) {
+  return std::ranges::any_of(UPSCALER_MODULE_PREFIXES, [name](std::wstring_view prefix) {
+    return name.size() >= prefix.size()
+           && _wcsnicmp(name.data(), prefix.data(), prefix.size()) == 0;
+  });
+}
+
+// Returns the file name of the upscaler runtime on the current call stack, or
+// an empty string. The walk stops at the host executable because the frames
+// below it are the game's own call chain.
+std::wstring FindUpscalerCaller() {
+  std::array<void*, 48> frames = {};
+  const USHORT frame_count = CaptureStackBackTrace(1, static_cast<DWORD>(frames.size()), frames.data(), nullptr);
+
+  const HMODULE executable = GetModuleHandleW(nullptr);
+  HMODULE previous_module = nullptr;
+  for (USHORT i = 0; i < frame_count; ++i) {
+    HMODULE module = nullptr;
+    if (GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            static_cast<LPCWSTR>(frames[i]),
+            &module)
+        == FALSE) {
+      continue;
+    }
+    if (module == previous_module) continue;
+    if (module == executable) break;
+    previous_module = module;
+
+    auto name = GetModuleName(module);
+    if (IsUpscalerModuleName(name)) return name;
+  }
+  return {};
+}
+
+bool ShouldInjectPipelineLayout(reshade::api::device* /*device*/, std::span<reshade::api::pipeline_layout_param> params) {
+  if (params.size() >= 20) return false;
+
+  const auto upscaler = FindUpscalerCaller();
+  if (upscaler.empty()) return true;
+
+  const std::scoped_lock lock(skipped_upscaler_modules_mutex);
+  if (skipped_upscaler_modules.insert(upscaler).second) {
+    std::string name;
+    std::ranges::transform(upscaler, std::back_inserter(name), [](wchar_t c) {
+      return c < 0x80 ? static_cast<char>(c) : '?';
+    });
+    reshade::log::message(
+        reshade::log::level::info,
+        std::format("Skipping pipeline layout injection for {}.", name).c_str());
+  }
+  return false;
+}
+
 bool initialized = false;
 
 }  // namespace
@@ -2403,9 +2489,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::reshade_overlay>(OnOverlay);
       // end keybind code
 
-      renodx::mods::shader::on_create_pipeline_layout = [](auto, auto params) {
-        return (params.size() < 20);
-      };
+      renodx::mods::shader::on_create_pipeline_layout = &ShouldInjectPipelineLayout;
 
       if (!initialized) {
         AddGameSettings();
