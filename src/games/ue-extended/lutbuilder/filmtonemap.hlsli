@@ -146,43 +146,17 @@ float3 ApplyToneCurveExtended(
 
 }  // unrealengine
 
-// input: blue-corrected AP1 linear
-// output: blue-corrected AP1 linear
-float3 ApplyExtendedToneCurveMaxChannel(
-    float3 tonemapped_blue_corrected_ap1,
-    float3 vanilla_blue_corrected_ap1,
-    float blue_correction) {
-  // Max Channel display mapping uses this reference to simulate hue/chroma blowout.
-  float3 bt709_hue_and_chrominance_source = BT709FromBlueCorrectedAP1(
-      renodx::tonemap::ReinhardPiecewise(tonemapped_blue_corrected_ap1, RENODX_TONE_MAP_PER_CH_PEAK, 0.18f),
-      blue_correction);
-
-  // UE games are extremely bright, and lerping toward vanilla helps reduce average picture brightness.
-  tonemapped_blue_corrected_ap1 = lerp(
-      tonemapped_blue_corrected_ap1,
-      vanilla_blue_corrected_ap1,
-      saturate(lerp(0.75f, 0.f, saturate(BLEND_FACTOR))));
-
-  float3 bt709_tonemapped = BT709FromBlueCorrectedAP1(tonemapped_blue_corrected_ap1, blue_correction);
-  return BlueCorrectedAP1FromBT709(
-      HueAndChrominance(
-          bt709_tonemapped,
-          bt709_hue_and_chrominance_source,
-          saturate(RENODX_TONE_MAP_HUE_SHIFT),
-          saturate(RENODX_TONE_MAP_CHROMA_CORRECT_BLOWOUT),
-          1.f),
-      blue_correction);
+float ComputeFilmicVanillaBlend() {
+  return saturate(lerp(0.75f, 0.f, saturate(BLEND_FACTOR)));
 }
 
 // input: blue-corrected AP1 linear
 // output: blue-corrected AP1 linear
 float3 ApplyExtendedToneCurveAP1(
     float3 tonemapped_blue_corrected_ap1,
-    float3 vanilla_blue_corrected_ap1) {
-  return lerp(
-      tonemapped_blue_corrected_ap1,
-      vanilla_blue_corrected_ap1,
-      saturate(lerp(0.75f, 0.f, saturate(BLEND_FACTOR))));
+  float3 vanilla_blue_corrected_ap1,
+  float vanilla_blend) {
+  return lerp(tonemapped_blue_corrected_ap1, vanilla_blue_corrected_ap1, vanilla_blend);
 }
 
 // input: white-normalized LMS linear
@@ -217,13 +191,13 @@ float3 ApplyExtendedToneCurveLMS(
       lerp(
           tonemapped_lms_normalized,
           vanilla_lms_normalized,
-          saturate(lerp(0.75f, 0.f, saturate(BLEND_FACTOR)))),
+          ComputeFilmicVanillaBlend()),
       RENODX_TONE_MAP_HUE_RESTORE);
 }
 
 // input: RRT value in blue-corrected AP1 linear
 // output: blue-corrected AP1 linear
-float3 ApplyToneCurveExtendedWithHermite(
+float3 ApplyToneCurveExtended(
     float3 untonemapped_rrt_blue_corrected_ap1,
     float blue_correction,
     float FilmSlope,
@@ -232,7 +206,7 @@ float3 ApplyToneCurveExtendedWithHermite(
     float FilmBlackClip,
     float FilmWhiteClip) {
   float filmic_black_clip = FilmBlackClip;
-  if (OVERRIDE_BLACK_CLIP) filmic_black_clip = 0.f;
+  if (OVERRIDE_BLACK_CLIP == 1.f || (OVERRIDE_BLACK_CLIP == 2.f && filmic_black_clip > 0.f)) filmic_black_clip = 0.f;
   unrealengine::filmtonemap::Config filmic_params =
       unrealengine::filmtonemap::config::Create(FilmSlope, FilmToe, FilmShoulder, filmic_black_clip, FilmWhiteClip);
 
@@ -244,15 +218,10 @@ float3 ApplyToneCurveExtendedWithHermite(
       vanilla_blue_corrected_ap1,
       filmic_params);
 
-  if (RENODX_TONE_MAP_SCALING == 0.f) {
-    return ApplyExtendedToneCurveMaxChannel(
-        tonemapped_blue_corrected_ap1,
-        vanilla_blue_corrected_ap1,
-        blue_correction);
-  }
   return ApplyExtendedToneCurveAP1(
       tonemapped_blue_corrected_ap1,
-      vanilla_blue_corrected_ap1);
+      vanilla_blue_corrected_ap1,
+      ComputeFilmicVanillaBlend());
 }
 
 #endif  // INCLUDE_FILMTONEMAP
